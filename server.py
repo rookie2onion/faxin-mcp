@@ -404,9 +404,14 @@ async def _get_lalk_token(ctx, force: bool = False) -> str:
         return _lalk_token
     _, body = await _http_get(ctx, FAXIN_BASE + "/")
     m = re.search(r'href="https://(?:[a-z0-9-]+\.)?wenshu\.faxin\.cn/wenshu/page/laIndex\.html\?[^"]*?token=([^&"]+)', body)
-    if not m:
-        raise SessionExpired("未能从首页提取类案检索 token（会话可能已过期）")
-    _lalk_token = m.group(1)
+    token_val = m.group(1) if m else ""
+    if not token_val:
+        raise SessionExpired(
+            "未能从首页提取类案检索 token。注意：法信主站（www.faxin.cn）首页 laIndex "
+            "链接的 token 为空、类案 token 生成机制与律协版不同——类案检索在主站暂不可用"
+            "（本连接器在律协版 sfb-vip.faxin.cn 下类案检索正常）。"
+        )
+    _lalk_token = token_val
     _lalk_token_at = time.time()
     return _lalk_token
 
@@ -956,6 +961,7 @@ async def list_tools() -> list[Tool]:
                 "返回 total + 案例列表（标题/案由/程序/法院/年份/三维推荐度/uniqid）。"
                 "uniqid 可直接传给 faxin_get_detail 取详情。"
                 "【与 search_case 的分工】search_case 查裁判规则要旨（编辑提炼），本工具查权威案例本体（可溯源到具体案件）。"
+                "【主站限制】法信主站（www.faxin.cn）类案 token 机制不同，本工具在主站暂不可用。"
             ),
             inputSchema={
                 "type": "object",

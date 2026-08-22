@@ -89,21 +89,28 @@ python3 -m venv .venv
 - 裁判规则库较大，单次检索需 7-17 秒属正常；**请低频使用，不要高频连续调用**
   （平台会临时限速，冷却约 60 秒自愈）。
 
-## 主站兼容性实测（2026-08-22，www.faxin.cn 匿名探测）
+## 主站兼容性实测（2026-08-22，www.faxin.cn 匿名 + 登录态双轮探测）
 
-| 能力 | 接口 | 匿名状态 | 说明 |
-|---|---|---|---|
-| 首页/登录页 | `/`、`/login.aspx` | ✅ 200 | 登录表单含账号密码/短信/扫码，结构正常 |
-| 分库计数 | `GetLibSearchResultNum.ashx` | ✅ 200 | 返回 JSON `{"lib":..,"searchnum":..}` |
-| 法规检索 | `GetFileInfoForZyfl.ashx` | ✅ 200 | 返回 `FirstHtml` 结果列表，结构同律协版 |
-| 法条直达 | `GetZyflTiaoInfo.ashx` | ✅ 200 | 返回条文全文+文号+效力信息 |
-| 法规详情 | `ZyflContent.aspx?gid=` | ✅ 200 | 服务端直出全文 |
-| **裁判规则检索** | `GetFileInfoForAlyz.ashx` | ⚠️ 匿名锁 | 接口 200 但返回「暂无内容」+ 全库默认计数；**需登录后验证** |
-| 裁判规则详情 | `AlyzContent.aspx?gid=` | ⚠️ 未验证 | 匿名探测被 WAF 中断，登录后待验证 |
-| 大纲概念 | `GetKeyWordList.ashx` | ⚠️ 未验证 | 匿名探测被 WAF 中断，登录后待验证 |
-| 类案检索 | `wenshu.faxin.cn/faxin/search/search` | ⚠️ 未验证 | 首页含 laIndex token 链接，登录后待验证 |
+**匿名可达（无需登录）：**
 
-**结论**：主站接口路径与律协 VIP 版**同构**（同一套 `.ashx` 接口、同一 gid 路由、同一 wenshu 子站链路），核心差异是**匿名权限收窄**（裁判规则等库匿名不可见）。登录你的法信账号后，可用范围以你账号的实际权限为准。**首个登录后的实测反馈欢迎提 issue。**
+| 能力 | 接口 | 状态 |
+|---|---|---|
+| 首页/登录页 | `/`、`/login.aspx` | ✅ 登录表单含账号密码/短信/扫码 |
+| 分库计数 | `GetLibSearchResultNum.ashx` | ✅ 返回 JSON `{"lib":..,"searchnum":..}` |
+| 法规检索 | `GetFileInfoForZyfl.ashx` | ✅ 返回 `FirstHtml` 结果列表 |
+| 法条直达 | `GetZyflTiaoInfo.ashx` | ✅ 返回条文全文+文号+效力信息 |
+| 法规详情 | `ZyflContent.aspx?gid=` | ✅ 服务端直出全文 |
+
+**登录后验证（个人法信账号实测）：**
+
+| 能力 | 接口 | 登录态结果 |
+|---|---|---|
+| 登录态 | 检索页重定向 | ✅ 已登录不跳转（接口会话复用成功） |
+| 大纲概念 | `GetKeyWordList.ashx` | ✅ 返回 `keywordhtml` 概念列表 |
+| **裁判规则检索** | `GetFileInfoForAlyz.ashx` | ❌ 接口按关键词计数（AllCount 随词变化）但**结果列表为空**——该账号对裁判规则库**无内容权限**（能计数、不给看）。计数接口 `lib=alyz` 返回 `searchnum=0` 印证。**需账号购买裁判规则库权限** |
+| 类案检索 | `wenshu.faxin.cn` | ⚠️ 首页 laIndex 链接 `token=` 为空，直接访问 `laIndex.html` 跳转 `wenshu/v2/#/index`（无 token）。**主站类案 token 生成机制与律协版不同，本工具在主站暂不支持类案检索**（待后续适配） |
+
+**结论**：主站接口路径与律协 VIP 版**同构**。法规检索/法条直达/大纲/详情读取**登录后即可用**；裁判规则库受**账号权限**限制（与连接器无关）；类案检索因主站 token 机制差异**暂不支持**（律协版正常）。
 
 ## ⚠️ 合规声明（使用前必读）
 
