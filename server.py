@@ -236,6 +236,15 @@ def parse_first_html(first_html: str) -> list[dict]:
     return out
 
 
+def _is_no_content(body: str) -> bool:
+    """判断检索响应是否为「暂无内容」（平台权限门或无命中的统一空态）。
+
+    权限门特征：接口返回 200 + AllCount>0（按关键词计数正常）但结果区为
+    「暂时没有找到您想要的内容」空态（no_content 容器），且无任何 gid 链接。
+    """
+    return ("no_content" in body) or ("暂时没有找到您想要的内容" in body)
+
+
 async def get_lib_counts(ctx, keyword: str, libs: list[str]) -> dict:
     """分库命中数。失败不阻塞主流程。注意：form 会自动编码，keyword 必须传原文。"""
     counts = {}
@@ -342,6 +351,28 @@ async def search_cases(ctx, keyword: str, max_results: int = MAX_RESULTS) -> dic
     for it in results:
         it["lib"] = "裁判规则"
     counts = await get_lib_counts(ctx, keyword, ["cpws_al"])
+
+    # 权限门检测：结果为空但接口按关键词计数正常（AllCount>0）且为平台空态
+    # → 账号对裁判规则库无内容权限，显式告知而非返回空列表
+    if not results:
+        all_count = 0
+        try:
+            all_count = int(data.get("AllCount", 0) or 0)
+        except (TypeError, ValueError):
+            all_count = 0
+        if _is_no_content(body) and all_count > 0:
+            return {
+                "results": [],
+                "raw_count": 0,
+                "counts": counts,
+                "permission_denied": True,
+                "lib_name": "裁判规则",
+                "message": (
+                    "当前账号对「裁判规则库」无内容访问权限（接口可按关键词计数 "
+                    f"AllCount={all_count}，但结果列表被平台锁定）。"
+                    "裁判规则库为法信付费库，请在法信官网为该账号开通相应权限后重试。"
+                ),
+            }
     return {
         "results": results[:max_results],
         "raw_count": len(results),
@@ -378,6 +409,19 @@ async def search_lib(ctx, keyword: str, lib: str, max_results: int = MAX_RESULTS
     results = parse_first_html(data.get("FirstHtml", ""))
     for it in results:
         it["lib"] = cfg["name"]
+    # 权限门检测：结果为空但接口按关键词计数正常且为平台空态 → 账号无该库权限
+    if not results:
+        all_count = 0
+        try:
+            all_count = int(data.get("AllCount", 0) or 0)
+        except (TypeError, ValueError):
+            all_count = 0
+        if _is_no_content(body) and all_count > 0:
+            return {"results": [], "raw_count": 0, "counts": {}, "lib_name": cfg["name"],
+                    "permission_denied": True,
+                    "message": (f"当前账号对「{cfg['name']}」库无内容访问权限（接口可按关键词计数 "
+                                f"AllCount={all_count}，但结果列表被平台锁定）。"
+                                "该库为法信付费库，请在法信官网为该账号开通相应权限后重试。")}
     return {"results": results[:max_results], "raw_count": len(results),
             "counts": {}, "lib_name": cfg["name"]}
 
@@ -842,6 +886,9 @@ def format_results(keyword: str, kind: str, data: dict) -> str:
         out += "分库命中：" + "、".join(f"{label.get(k, k)} {v} 条" for k, v in counts.items()) + "\n\n"
     if data.get("timeliness_applied"):
         out += f"时效筛选：{data['timeliness_applied']}\n\n"
+    if data.get("permission_denied"):
+        out += f"🔒 **{data.get('lib_name', kind)}库访问受限**\n\n{data['message']}\n"
+        return out
     if not results:
         out += ("未找到相关结果。建议：①换用案由词/法条原文表述（如「买卖合同」而非「违约」）；"
                 "②确认关键词无错别字；③放宽时效筛选。\n")
