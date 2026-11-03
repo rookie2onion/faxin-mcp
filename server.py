@@ -45,7 +45,10 @@ from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, CallToolResult
+
+from faxin_html import is_login_page, parse_detail, parse_outline
+from login import is_logged_in
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger("faxin-mcp")
 
 # ── 配置 ──────────────────────────────────────────────
-FAXIN_BASE = os.environ.get("FAXIN_BASE_URL", "https://www.faxin.cn")
+FAXIN_BASE = os.environ.get("FAXIN_BASE_URL", "https://www.faxin.cn").rstrip('/')
 USER_DATA_DIR = os.environ.get(
     "FAXIN_USER_DATA_DIR",
     str(Path.home() / ".faxin-mcp" / "browser-data"),
@@ -69,32 +72,53 @@ app = Server("faxin-mcp")
 
 # ── 浏览器上下文（仅作 cookie 容器）────────────────────
 _context = None
+_playwright = None
 _ctx_lock = asyncio.Lock()
 
 
 async def get_context():
     """获取或创建持久化 context。刻意无反检测参数（不需要）。"""
-    global _context
+    global _context, _playwright, _login_ok_at, _lalk_token, _lalk_token_at
     async with _ctx_lock:
         if _context:
             try:
-                _ = _context.pages  # 探测 context 是否仍可用
+                await _context.cookies()  # 本地协议调用，探测 context 是否已关闭
                 return _context
             except Exception:
                 _context = None
+        if _playwright:
+            await _playwright.stop()
+            _playwright = None
         from playwright.async_api import async_playwright
 
-        pw = await async_playwright().start()
         Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
-        _context = await pw.chromium.launch_persistent_context(
-            user_data_dir=USER_DATA_DIR,
-            headless=HEADLESS,
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-            # 合规声明：不使用 --disable-blink-features=AutomationControlled 等
-            # 任何隐藏自动化特征的参数。
-        )
+        pw = await async_playwright().start()
+        try:
+            _context = await pw.chromium.launch_persistent_context(
+                user_data_dir=USER_DATA_DIR, headless=HEADLESS,
+                viewport={"width": 1440, "height": 900}, locale="zh-CN",
+            )
+        except BaseException:
+            await pw.stop()
+            raise
+        _playwright = pw
+        _login_ok_at, _lalk_token, _lalk_token_at = 0, '', 0
         return _context
+
+
+async def close_context():
+    """关闭持久化浏览器，释放供 login.py 使用的数据目录。"""
+    global _context, _playwright, _login_ok_at, _lalk_token, _lalk_token_at
+    async with _ctx_lock:
+        context, driver = _context, _playwright
+        _context, _playwright = None, None
+        _login_ok_at, _lalk_token, _lalk_token_at = 0, '', 0
+        try:
+            if context:
+                await context.close()
+        finally:
+            if driver:
+                await driver.stop()
 
 
 class SessionExpired(Exception):
@@ -102,10 +126,20 @@ class SessionExpired(Exception):
     pass
 
 
+class FeatureUnavailable(ValueError):
+    """当前法信入口不支持此功能，与登录状态无关。"""
+
+
+def _check_lalei_support():
+    if urllib.parse.urlsplit(FAXIN_BASE).hostname in ('www.faxin.cn', 'faxin.cn'):
+        raise FeatureUnavailable("法信主站暂不支持类案检索：当前连接器尚未适配主站 token 机制；重新登录不能解决此限制")
+
+
 _LOGIN_HINT = (
-    "❌ 法信会话已过期或未登录，无法检索。请重新登录：\n"
-    "1. 终端运行 login.py（弹出浏览器，用本人法信官网账号登录）；\n"
-    "2. 登录成功后按回车保存即可，无需重启本服务。\n"
+    "❌ 法信登录态未通过验证，暂时无法检索。需要重新登录时请按以下步骤操作：\n"
+    "1. 在 MCP 客户端中停止本服务，释放浏览器数据目录；\n"
+    "2. 终端运行 login.py，在浏览器中用本人法信账号登录并按回车保存；\n"
+    "3. 登录验证成功后，重新启动 MCP 服务。\n"
     "（会话有效期有限，过期属正常现象）"
 )
 
@@ -114,10 +148,53 @@ _login_ok_at = 0.0
 
 
 def _looks_like_login_page(url: str, body: str) -> bool:
-    if "login" in url.lower():
-        return True
-    head = body[:3000]
-    return ("请输入账号" in head) or ("请先登录" in head) or ("登录法信" in head and "退出" not in head)
+    return is_login_page(url, body)
+
+
+def _validate_faxin_url(url: str) -> str:
+    base = urllib.parse.urlsplit(FAXIN_BASE)
+    if (base.scheme != 'https' or not base.hostname
+            or not (base.hostname == 'faxin.cn' or base.hostname.endswith('.faxin.cn'))
+            or base.username is not None or base.password is not None
+            or base.port not in (None, 443) or base.path not in ('', '/')
+            or base.query or base.fragment):
+        raise ValueError("FAXIN_BASE_URL 必须是法信域名下的 HTTPS 入口")
+    target = urllib.parse.urlsplit(url)
+    if (re.search(r'[\x00-\x20\\]', url) or target.scheme != 'https'
+            or target.hostname != base.hostname or target.port not in (None, 443)
+            or target.username is not None or target.password is not None):
+        raise ValueError("只允许访问当前配置的法信 HTTPS 入口")
+    return url
+
+
+async def _request(ctx, method: str, url: str, **kwargs):
+    """Follow only same-origin HTTPS redirects, validating each hop before sending."""
+    for hop in range(6):
+        _validate_faxin_url(url)
+        response = await getattr(ctx.request, method)(url, max_redirects=0, **kwargs)
+        _validate_faxin_url(response.url)
+        if response.status in (301, 302, 303, 307, 308):
+            location = response.headers.get('location')
+            await response.dispose()
+            if not location or hop == 5:
+                raise ValueError("法信接口重定向异常")
+            url = _validate_faxin_url(urllib.parse.urljoin(url, location))
+            if is_login_page(url, ''):
+                raise SessionExpired("法信接口重定向至登录页")
+            if response.status == 303 or (response.status in (301, 302) and method == 'post'):
+                method = 'get'
+                kwargs.pop('form', None)
+            continue
+        if not 200 <= response.status < 300:
+            status = response.status
+            await response.dispose()
+            if status == 401:
+                raise SessionExpired("法信接口要求重新登录（HTTP 401）")
+            if status == 429:
+                raise ValueError("法信接口限流（HTTP 429），请稍后重试")
+            raise ValueError(f"法信接口返回 HTTP {status}，不能作为正文或检索结果")
+        return response
+    raise ValueError("法信接口重定向过多")
 
 
 async def _http_post(ctx, path: str, form: dict) -> str:
@@ -126,7 +203,7 @@ async def _http_post(ctx, path: str, form: dict) -> str:
     resp = None
     for attempt in range(2):
         try:
-            resp = await ctx.request.post(
+            resp = await _request(ctx, 'post',
                 FAXIN_BASE + path,
                 form=form,
                 headers={"X-Requested-With": "XMLHttpRequest"},
@@ -138,7 +215,10 @@ async def _http_post(ctx, path: str, form: dict) -> str:
                 raise
             logger.info(f"POST {path} 超时，重试一次")
             await asyncio.sleep(1)
-    body = await resp.text()
+    try:
+        body = await resp.text()
+    finally:
+        await resp.dispose()
     if _looks_like_login_page(resp.url, body):
         raise SessionExpired(f"POST {path} 被重定向至登录页")
     return body
@@ -147,30 +227,33 @@ async def _http_post(ctx, path: str, form: dict) -> str:
 async def _http_get(ctx, path_or_url: str) -> tuple[str, str]:
     """带会话 GET，返回 (最终URL, 响应文本)。"""
     url = path_or_url if path_or_url.startswith("http") else FAXIN_BASE + path_or_url
-    resp = await ctx.request.get(url, timeout=HTTP_TIMEOUT)
-    body = await resp.text()
+    resp = await _request(ctx, 'get', url, timeout=HTTP_TIMEOUT)
+    try:
+        body = await resp.text()
+    finally:
+        await resp.dispose()
     if _looks_like_login_page(resp.url, body):
         raise SessionExpired(f"GET {url} 被重定向至登录页")
     return resp.url, body
 
 
 async def ensure_login(ctx, force: bool = False) -> tuple[bool, str]:
-    """轻量登录态判定：调分库计数接口，返回 JSON 即已登录。结果缓存 30 分钟。"""
+    """检查检索页中的明确账号标识；接口可达或匿名计数不能证明登录。"""
     global _login_ok_at
     if not force and (time.time() - _login_ok_at) < LOGIN_CACHE_TTL:
         return True, "登录态缓存有效（30分钟内已验证）"
+    _login_ok_at = 0
     try:
-        body = await _http_post(
-            ctx,
-            "/alllibsearch/GetLibSearchResultNum.ashx",
-            {"k": "test", "IsInResult": "0", "keyword_inResult": "test",
-             "usersearchtype": "1", "lib": "zyfl"},
-        )
-        data = json.loads(body)
-        if "searchnum" in data:
+        _validate_faxin_url(FAXIN_BASE + '/alllibsearch/SearchResult.aspx')
+        page = await ctx.new_page()
+        try:
+            state = await is_logged_in(page, base_url=FAXIN_BASE)
+        finally:
+            await page.close()
+        if state is True:
             _login_ok_at = time.time()
-            return True, "会话有效"
-        return False, f"计数接口返回异常: {body[:100]}"
+            return True, "浏览器检索页已确认可见账号控件"
+        return False, "无法确认登录态：检索页没有明确的账号标识，请检查官网登录状态或页面结构变化"
     except SessionExpired as e:
         return False, str(e)
     except Exception as e:
@@ -192,9 +275,9 @@ def parse_first_html(first_html: str) -> list[dict]:
     """
     results = []
     group = ""
-    for li in re.findall(r"<li[^>]*>(.*?)</li>", first_html, re.S | re.I):
+    for attributes, li in re.findall(r"<li\b([^>]*)>(.*?)</li>", first_html, re.S | re.I):
         # 分组头：<li class='allmore'>司法解释（33）...
-        if "allmore" in li[:80]:
+        if re.search(r'\ballmore\b', attributes, re.I):
             g = _strip_tags(li)
             g = re.sub(r"更多.*$", "", g).strip()
             if g:
@@ -203,7 +286,7 @@ def parse_first_html(first_html: str) -> list[dict]:
         m = re.search(r"<a[^>]+href=['\"]([^'\"]*gid=[A-Z0-9]+[^'\"]*)['\"][^>]*>(.*?)</a>", li, re.S | re.I)
         if not m:
             continue
-        href, title = m.group(1), _strip_tags(m.group(2))
+        href, title = _html.unescape(m.group(1)), _strip_tags(m.group(2))
         if not title or len(title) < 2:
             continue
         gid_m = re.search(r"gid=([A-Z0-9]+)", href)
@@ -450,14 +533,22 @@ async def _get_lalk_token(ctx, force: bool = False) -> str:
     m = re.search(r'href="https://(?:[a-z0-9-]+\.)?wenshu\.faxin\.cn/wenshu/page/laIndex\.html\?[^"]*?token=([^&"]+)', body)
     token_val = m.group(1) if m else ""
     if not token_val:
-        raise SessionExpired(
-            "未能从首页提取类案检索 token。注意：法信主站（www.faxin.cn）首页 laIndex "
-            "链接的 token 为空、类案 token 生成机制与律协版不同——类案检索在主站暂不可用"
-            "（本连接器在律协版 sfb-vip.faxin.cn 下类案检索正常）。"
-        )
+        raise FeatureUnavailable("当前法信入口未提供可识别的类案 token，请核对入口、账号权限或接口兼容性")
     _lalk_token = token_val
     _lalk_token_at = time.time()
     return _lalk_token
+
+
+async def _post_lalei(ctx, payload: dict, token: str) -> tuple[int, str]:
+    response = await ctx.request.post(
+        f"{WENSHU_API}/search/search", data=json.dumps(payload),
+        headers={"faxintoken": token, "Content-Type": "application/json"},
+        timeout=HTTP_TIMEOUT, max_redirects=0,
+    )
+    try:
+        return response.status, await response.text()
+    finally:
+        await response.dispose()
 
 
 async def search_lalei(ctx, keyword: str = "", casetype: str = "", casecause: str = "",
@@ -465,6 +556,7 @@ async def search_lalei(ctx, keyword: str = "", casetype: str = "", casecause: st
                        judgeyear: str = "", procedure: str = "",
                        size: int = 10, index: str = "fxal") -> dict:
     """类案检索（权威案例库）。条件 AND 组合；keyword 走标题匹配。"""
+    _check_lalei_support()
     conds = []
     if keyword:
         conds.append({"type": 2, "field": "title", "value": keyword})
@@ -483,26 +575,16 @@ async def search_lalei(ctx, keyword: str = "", casetype: str = "", casecause: st
         "params": {"from": 0, "size": min(size, 30),
                    "sort": ["_score desc", "fit_score desc"], "index": index},
     }
-    resp = await ctx.request.post(
-        f"{WENSHU_API}/search/search",
-        data=json.dumps(payload),
-        headers={"faxintoken": token, "Content-Type": "application/json"},
-        timeout=HTTP_TIMEOUT,
-    )
-    body = await resp.text()
-    if resp.status in (400, 401, 403):
+    status, body = await _post_lalei(ctx, payload, token)
+    if status in (401, 403):
         # token 失效：清缓存重试一次
         token = await _get_lalk_token(ctx, force=True)
-        resp = await ctx.request.post(
-            f"{WENSHU_API}/search/search",
-            data=json.dumps(payload),
-            headers={"faxintoken": token, "Content-Type": "application/json"},
-            timeout=HTTP_TIMEOUT,
-        )
-        body = await resp.text()
+        status, body = await _post_lalei(ctx, payload, token)
+    if not 200 <= status < 300:
+        raise ValueError(f"类案接口返回 HTTP {status}，不能视为无检索结果；请核对权限或稍后重试")
     data = json.loads(body)
-    if data.get("status") == 400:
-        raise ValueError(f"类案检索请求被拒：{body[:150]}")
+    if data.get("status") not in (None, 0, 200):
+        raise ValueError(f"类案接口拒绝请求（状态 {data['status']}），请核对权限和接口兼容性")
     result = data.get("data") or {}
     docs = []
     for d in (result.get("docs") or []):
@@ -538,12 +620,12 @@ async def get_tiao(ctx, law: str, tiao: str) -> dict:
     num = cn_to_int(m.group(1))
     if num is None:
         raise ValueError(f"条号无法解析：{tiao}")
-    cn = int_to_cn(num) + (m.group(2) or "")
+    article_label = "第" + int_to_cn(num) + "条" + (m.group(2) or "")
 
     body = await _http_post(ctx, "/alllibsearch/GetZyflTiaoInfo.ashx",
-                            {"k": f"{law}第{cn}条", "t": "1"})
+                            {"k": f"{law}{article_label}", "t": "1"})
     if not body.strip():
-        raise ValueError(f"未命中：{law}第{cn}条。请核对法规名与条号（条号需为中文或阿拉伯整数）")
+        raise ValueError(f"未命中：{law}{article_label}。请核对法规名与条号（条号需为中文或阿拉伯整数）")
 
     out = {"law": "", "gid": "", "anchor_url": "", "doc_no_dates": "", "tiao": "", "content": ""}
     tm = re.search(r'<a href="(/lib/Zyfl/ZyflContent\.aspx\?gid=([A-Z0-9]+)#(\d+))"[^>]*>([^<]+)</a><br\s*/?><span>([^<]*)</span>', body)
@@ -562,7 +644,7 @@ async def get_tiao(ctx, law: str, tiao: str) -> dict:
         if tm2:
             out["tiao"] = tm2.group(1)
     if not out["content"]:
-        raise ValueError(f"命中法规但条文解析失败：{law}第{cn}条（响应结构可能已变化）")
+        raise ValueError(f"命中法规但条文解析失败：{law}{article_label}（响应结构可能已变化）")
     return out
 
 
@@ -607,53 +689,13 @@ async def search_outline(ctx, keyword: str, max_results: int = 10) -> list[dict]
     return out[:max_results]
 
 
-_OUTLINE_EXTRACT_JS = """() => {
-    const out = {name: '', code: '', path: '', counts: {}, laws: []};
-    // 概念名+法信码：.right_navation 内的 label，文本形如 "A2.E6买卖合同纠纷"
-    const nav = document.querySelector('.right_navation');
-    const labelEl = nav ? nav.querySelector('label') : null;
-    const labelTxt = (labelEl ? labelEl.textContent : '').trim();
-    const cm = labelTxt.match(/^([A-Z]\\d+(?:\\.[A-Z]+\\d+)*)([\\s\\S]*)$/);
-    if (cm) { out.code = cm[1]; out.name = cm[2].trim(); }
-    // 大纲路径：nav 区域内含「>」的文本行
-    if (nav) {
-        const lines = (nav.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
-        const pathLine = lines.filter(l => l.includes('>') && !l.includes('[')).pop() || '';
-        out.path = pathLine.replace(/\\s*·+\\s*>\\s*·+\\s*/g, ' > ').replace(/\\s*>\\s*/g, ' > ').trim();
-    }
-    // 分库计数：li.navation_item，文本形如「法 律 99+」「裁判规则 99+」
-    document.querySelectorAll('li.navation_item').forEach(li => {
-        const m = (li.textContent || '').trim().match(/^([\\S\\s]*?)\\s*([0-9]+\\+?)$/);
-        if (m) {
-            const key = m[1].replace(/\\s+/g, '');
-            if (key) out.counts[key] = m[2];
-        }
-    });
-    // 法条摘录条目
-    document.querySelectorAll('.content_item').forEach(item => {
-        const a = item.querySelector('a[href*="/lib/"]');
-        const txt = (item.innerText || '').trim();
-        if (!txt) return;
-        const lines = txt.split('\\n').map(s => s.trim()).filter(Boolean);
-        out.laws.push({
-            law: a ? a.innerText.trim() : (lines[0] || ''),
-            url: a ? a.href : '',
-            excerpt: lines.slice(1).join(' ').slice(0, 300),
-        });
-    });
-    return out;
-}"""
-
-
 async def get_outline(ctx, concept_id: str) -> dict:
     """取概念详情：名称/法信码/路径/分库计数/相关法条摘录。"""
     cid = re.sub(r"\D", "", str(concept_id))
     if not cid:
         raise ValueError("概念 id 必须是数字（由 faxin_search_outline 返回）")
     _, body = await _http_get(ctx, f"{FAXIN_BASE}/keyword/KeyWordDetail.aspx?id={cid}")
-    page = await _get_parse_page(ctx)
-    await page.set_content(body, wait_until="domcontentloaded")
-    data = await page.evaluate(_OUTLINE_EXTRACT_JS)
+    data = parse_outline(body, FAXIN_BASE)
     data["id"] = cid
     data["url"] = f"{FAXIN_BASE}/keyword/KeyWordDetail.aspx?id={cid}"
     return data
@@ -678,80 +720,23 @@ GID_ROUTES = {
 def gid_to_detail_path(gid_or_url: str) -> str:
     """gid 前缀路由到详情页路径（见 GID_ROUTES）。"""
     s = gid_or_url.strip()
-    if s.startswith("http"):
-        return s
-    if s.startswith("/lib"):
-        return FAXIN_BASE + s
-    prefix = s[0].upper() if s else ""
-    route = GID_ROUTES.get(prefix)
-    if route:
-        return FAXIN_BASE + route + s
-    # 未知前缀默认按中央法规试
-    return f"{FAXIN_BASE}/lib/zyfl/zyflcontent.aspx?gid={s}"
+    if s.startswith(("https://", "http://", "/")):
+        url = urllib.parse.urljoin(FAXIN_BASE.rstrip('/') + '/', s)
+        _validate_faxin_url(url)
+        parsed = urllib.parse.urlsplit(url)
+        paths = {urllib.parse.urlsplit(route).path.lower() for route in GID_ROUTES.values()}
+        gids = urllib.parse.parse_qs(parsed.query).get('gid', [])
+        if parsed.path.lower() not in paths or len(gids) != 1 or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', gids[0]):
+            raise ValueError("详情 URL 必须是当前法信入口的文档详情页，并包含合法 gid")
+        return url
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', s) or s[0].upper() not in GID_ROUTES:
+        raise ValueError("gid 格式或库前缀无效；请使用检索结果中的 gid")
+    return FAXIN_BASE.rstrip('/') + GID_ROUTES[s[0].upper()] + urllib.parse.quote(s, safe='')
 
 
-# ── 详情解析（set_content + DOM 查询，不导航）─────────
-_parse_page = None
-
-
-async def _get_parse_page(ctx):
-    """复用一个空白页做 DOM 解析（set_content 本地解析，无网络导航）。"""
-    global _parse_page
-    if _parse_page and not _parse_page.is_closed():
-        return _parse_page
-    _parse_page = await ctx.new_page()
-    return _parse_page
-
-
-_DETAIL_EXTRACT_JS = """() => {
-    const out = {title: '', meta: {}, content: ''};
-    // 标题：<title> 去掉「 - 法信 - ...」后缀
-    out.title = (document.title || '').replace(/\\s*-\\s*法信.*$/, '').trim();
-    // 正文：法规 .box.fulltext；裁判规则 .content；退化 body
-    const cands = ['.box.fulltext', '.content', '#content', '.article-content'];
-    for (const s of cands) {
-        const el = document.querySelector(s);
-        if (el && el.innerText.trim().length > 100) {
-            out.content = el.innerText.trim();
-            break;
-        }
-    }
-    if (!out.content) {
-        let t = document.body ? document.body.innerText : '';
-        const stop = t.indexOf('法信简介');
-        out.content = (stop > 100 ? t.slice(0, stop) : t).trim();
-    }
-    // meta：法规详情页的文档属性在「属性标签」弹框 .js-sxTab 内（默认隐藏但服务端直出）。
-    // 结构为键值相邻行：制定机关/最高人民法院/文号/法释〔2025〕1号/效力等级/…/时效性/现行有效
-    const KEYS = ['制定机关','文号','发文字号','效力等级','效力级别','公布日期','施行日期','时效性','主题分类','法律类别'];
-    const tab = document.querySelector('.js-sxTab');
-    if (tab) {
-        // 弹框默认 display:none，innerText 取不到隐藏内容，必须用 textContent
-        const raw = (tab.textContent || '').replace(/[ \\t\\r]+/g, ' ');
-        const lines = raw.split('\\n').map(s => s.trim()).filter(Boolean);
-        for (let i = 0; i < lines.length - 1; i++) {
-            if (KEYS.includes(lines[i]) && !out.meta[lines[i]]) {
-                const v = lines[i + 1];
-                if (!KEYS.includes(v)) out.meta[lines[i]] = v;
-            }
-        }
-    }
-    return out;
-}"""
-
-
+# 详情解析保持为异步接口，便于现有调用者复用；解析本身无浏览器和网络副作用。
 async def parse_detail_html(ctx, body: str) -> dict:
-    """把服务端直出的详情页 HTML 装进空白页做 DOM 解析。"""
-    page = await _get_parse_page(ctx)
-    await page.set_content(body, wait_until="domcontentloaded")
-    data = await page.evaluate(_DETAIL_EXTRACT_JS)
-    if not data.get("title") and data.get("content"):
-        data["title"] = data["content"].split("\n", 1)[0][:60]
-    return {
-        "title": data.get("title") or "(无标题)",
-        "meta": data.get("meta") or {},
-        "content": (data.get("content") or "").strip(),
-    }
+    return parse_detail(body)
 
 
 # 中文数字转换（支持到 9999，覆盖民法典 1260 条）
@@ -786,21 +771,32 @@ def cn_to_int(s: str) -> int | None:
     return section + number
 
 
-_TIAO_RE = re.compile(r"第([一二三四五六七八九十百千零0-9]+)条(之[一二三四五六七八九十]+)?")
+_ARTICLE_START = r"^[ \t\u3000]*第([一二三四五六七八九十百千零0-9]+)条(之[一二三四五六七八九十]+)?"
+_TIAO_CANDIDATE_RE = re.compile(_ARTICLE_START, re.M)
+_TIAO_RE = re.compile(_ARTICLE_START + r"(?=[ \t\u3000【〔（(:：]|$)", re.M)
 _CN_UNIT = [(1000, "千"), (100, "百"), (10, "十")]
 _CN_NUM = "零一二三四五六七八九"
 
 
 def int_to_cn(n: int) -> str:
     """整数转中文数字（1-9999，覆盖法条号场景）：577→五百七十七，1260→一千二百六十"""
+    if not 1 <= n <= 9999:
+        raise ValueError("条号须在 1 到 9999 之间")
     if n <= 10:
         return _CN_NUM[n] if n < 10 else "十"
-    parts, rem = [], n
+    parts, rem, pending_zero = [], n, False
     for unit, name in _CN_UNIT:
         if rem >= unit:
+            if pending_zero:
+                parts.append("零")
+                pending_zero = False
             d, rem = divmod(rem, unit)
             parts.append(_CN_NUM[d] + name)
+        elif parts and rem:
+            pending_zero = True
     if rem:
+        if pending_zero:
+            parts.append("零")
         parts.append(_CN_NUM[rem])
     s = "".join(parts)
     # 口语化规则：1X 开头读「十X」而非「一十X」
@@ -822,17 +818,30 @@ def extract_tiao(content: str, tiao: str) -> str | None:
     if num is None:
         return None
     suffix = m.group(2) or ""
-    cn_num = int_to_cn(num)
-    # 同时尝试中文数字形与原始输入形（个别文件条文号用阿拉伯数字）
-    forms = {cn_num, m.group(1)}
-    for form in forms:
-        target_re = re.compile(r"第" + form + r"条" + (suffix if suffix else r"(?!之)"))
-        match = target_re.search(content)
-        if match:
-            start = match.start()
-            nxt = _TIAO_RE.search(content, match.end())
-            end = nxt.start() if nxt else min(len(content), start + 2000)
-            return content[start:end].strip()
+    headings = list(_TIAO_RE.finditer(content))
+    candidates = list(_TIAO_CANDIDATE_RE.finditer(content))
+    clear_positions = {heading.start() for heading in headings}
+
+    def key(heading):
+        return cn_to_int(heading.group(1)), heading.group(2) or ""
+
+    for index, heading in enumerate(headings):
+        if key(heading) == (num, suffix):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+            for candidate in candidates:
+                if candidate.start() in clear_positions or candidate.start() >= end:
+                    continue
+                if candidate.start() < heading.start():
+                    if key(candidate) == (num, suffix):
+                        return None
+                    continue
+                # A later, clearly delimited heading identifies this as a reference.
+                # Otherwise the unspaced prefix is ambiguous: never merge or cut silently.
+                if not any(later.start() > candidate.start() and key(later) == key(candidate)
+                           for later in headings):
+                    return None
+            return content[heading.start():end].strip()
+
     return None
 
 
@@ -856,8 +865,8 @@ async def get_detail(ctx, gid: str, tiao: str = "") -> dict:
         seg = extract_tiao(content, tiao)
         if seg:
             content = seg
-            _t = tiao.strip().lstrip("第").rstrip("条")
-            tiao_note = f"已定位「第{_t}条」"
+            label = _TIAO_RE.match(content).group(0).strip()
+            tiao_note = f"已定位「{label}」"
         else:
             tiao_note = f"⚠️ 未能在正文中定位「第{tiao}条」，返回全文开头（请人工核对条号写法）"
             content = content[:8000]
@@ -948,7 +957,7 @@ async def list_tools() -> list[Tool]:
                         "enum": ["all", "central", "local"],
                         "description": "库别：central=中央法规 local=地方法规 all=两者（默认）",
                     },
-                    "max_results": {"type": "integer", "description": "返回条数上限（默认20，最大50）"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "description": "返回条数上限（默认20，最大50）"},
                 },
                 "required": ["keyword"],
             },
@@ -966,7 +975,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "keyword": {"type": "string", "description": "检索关键词（案由词优先）"},
-                    "max_results": {"type": "integer", "description": "返回条数上限（默认20，最大30——裁判规则库大，响应较慢，低频使用）"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 30, "description": "返回条数上限（默认20，最大30——裁判规则库大，响应较慢，低频使用）"},
                 },
                 "required": ["keyword"],
             },
@@ -993,7 +1002,7 @@ async def list_tools() -> list[Tool]:
                         "enum": ["gjty", "xgk", "amk", "flqk", "flsy", "lf", "sf"],
                         "description": "专题库代码",
                     },
-                    "max_results": {"type": "integer", "description": "返回条数上限（默认20，最大30）"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 30, "description": "返回条数上限（默认20，最大30）"},
                 },
                 "required": ["keyword", "lib"],
             },
@@ -1021,7 +1030,7 @@ async def list_tools() -> list[Tool]:
                     "courtlevel": {"type": "string", "description": "法院级别（如「最高人民法院」「高级法院」）"},
                     "judgeyear": {"type": "string", "description": "裁判年份（如「2023」）"},
                     "procedure": {"type": "string", "description": "审理程序（如「二审」「再审」）"},
-                    "size": {"type": "integer", "description": "返回条数（默认10，最大30）"},
+                    "size": {"type": "integer", "minimum": 1, "maximum": 30, "description": "返回条数（默认10，最大30）"},
                 },
             },
         ),
@@ -1056,7 +1065,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "keyword": {"type": "string", "description": "法律概念或场景词，如「买卖合同」「违约金」「人格权」"},
-                    "max_results": {"type": "integer", "description": "返回概念数上限（默认10）"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 30, "description": "返回概念数上限（默认10）"},
                 },
                 "required": ["keyword"],
             },
@@ -1098,32 +1107,47 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+def _error_result(message: str) -> CallToolResult:
+    return CallToolResult(isError=True, content=[TextContent(type='text', text=message)])
+
+
+def _search_result(keyword: str, kind: str, data: dict) -> list[TextContent] | CallToolResult:
+    text = format_results(keyword, kind, data)
+    if data.get('permission_denied'):
+        return _error_result(text)
+    return [TextContent(type='text', text=text)]
+
+
 async def _guarded(ctx):
     """登录守卫：返回 None 表示已登录；否则返回错误内容列表。"""
     ok, diag = await ensure_login(ctx)
     if not ok:
         logger.warning(f"登录态校验未通过：{diag}")
-        return [TextContent(type="text", text=f"{_LOGIN_HINT}\n（诊断：{diag}）")]
+        return _error_result(f"{_LOGIN_HINT}\n（诊断：{diag}）")
     return None
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    logger.info(f"调用工具: {name}, 参数: {arguments}")
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
+    logger.info("调用工具: %s", name)
     global _login_ok_at
     try:
+        if name == 'faxin_search_lalei':
+            _check_lalei_support()
+        if name == 'faxin_get_detail':
+            gid_to_detail_path(arguments.get('gid') or '')
         ctx = await get_context()
 
         if name == "faxin_check_login":
             ok, diag = await ensure_login(ctx, force=bool(arguments.get("force")))
             if ok:
                 return [TextContent(type="text", text=f"✅ 法信已登录，可以正常检索。（{diag}）")]
-            return [TextContent(type="text", text=f"{_LOGIN_HINT}\n（诊断：{diag}）")]
+            return _error_result(f"{_LOGIN_HINT}\n（诊断：{diag}）")
 
         elif name == "faxin_search_law":
             keyword = (arguments.get("keyword") or "").strip()
             if not keyword:
-                return [TextContent(type="text", text="⚠️ 请提供 keyword 参数。")]
+                return _error_result("⚠️ 请提供 keyword 参数。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1133,12 +1157,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 lib=arguments.get("lib", "all"),
                 max_results=min(int(arguments.get("max_results") or MAX_RESULTS), 50),
             )
-            return [TextContent(type="text", text=format_results(keyword, "法规", data))]
+            return _search_result(keyword, "法规", data)
 
         elif name == "faxin_search_case":
             keyword = (arguments.get("keyword") or "").strip()
             if not keyword:
-                return [TextContent(type="text", text="⚠️ 请提供 keyword 参数。")]
+                return _error_result("⚠️ 请提供 keyword 参数。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1146,13 +1170,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ctx, keyword,
                 max_results=min(int(arguments.get("max_results") or MAX_RESULTS), 30),
             )
-            return [TextContent(type="text", text=format_results(keyword, "裁判规则", data))]
+            return _search_result(keyword, "裁判规则", data)
 
         elif name == "faxin_search_lib":
             keyword = (arguments.get("keyword") or "").strip()
             lib = (arguments.get("lib") or "").strip()
             if not keyword or lib not in EXTRA_LIBS:
-                return [TextContent(type="text", text=f"⚠️ 请提供 keyword 和合法的 lib（{ '/'.join(EXTRA_LIBS) }）。")]
+                return _error_result(f"⚠️ 请提供 keyword 和合法的 lib（{ '/'.join(EXTRA_LIBS) }）。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1160,7 +1184,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ctx, keyword, lib,
                 max_results=min(int(arguments.get("max_results") or MAX_RESULTS), 30),
             )
-            return [TextContent(type="text", text=format_results(keyword, data["lib_name"], data))]
+            return _search_result(keyword, data["lib_name"], data)
 
         elif name == "faxin_search_lalei":
             err = await _guarded(ctx)
@@ -1199,7 +1223,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             law = (arguments.get("law") or "").strip()
             tiao = (arguments.get("tiao") or "").strip()
             if not law or not tiao:
-                return [TextContent(type="text", text="⚠️ 请提供 law（法规名）和 tiao（条号）参数。")]
+                return _error_result("⚠️ 请提供 law（法规名）和 tiao（条号）参数。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1216,7 +1240,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "faxin_search_outline":
             keyword = (arguments.get("keyword") or "").strip()
             if not keyword:
-                return [TextContent(type="text", text="⚠️ 请提供 keyword 参数。")]
+                return _error_result("⚠️ 请提供 keyword 参数。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1236,7 +1260,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "faxin_get_outline":
             cid = (arguments.get("id") or "").strip()
             if not cid:
-                return [TextContent(type="text", text="⚠️ 请提供 id 参数（由 faxin_search_outline 返回）。")]
+                return _error_result("⚠️ 请提供 id 参数（由 faxin_search_outline 返回）。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1257,7 +1281,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "faxin_get_detail":
             gid = (arguments.get("gid") or "").strip()
             if not gid:
-                return [TextContent(type="text", text="⚠️ 请提供 gid 参数。")]
+                return _error_result("⚠️ 请提供 gid 参数。")
             err = await _guarded(ctx)
             if err:
                 return err
@@ -1275,20 +1299,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 out += "\n_（正文过长已截断；法规类建议用 tiao 参数按条取）_\n"
             return [TextContent(type="text", text=out)]
 
-        return [TextContent(type="text", text=f"未知工具：{name}")]
+        return _error_result(f"未知工具：{name}")
 
     except SessionExpired as e:
         _login_ok_at = 0  # 会话失效，清缓存强制下次重检
         logger.warning(f"会话失效：{e}")
-        return [TextContent(type="text", text=f"{_LOGIN_HINT}\n（诊断：{e}）")]
+        return _error_result(f"{_LOGIN_HINT}\n（诊断：{e}）")
+    except ValueError as e:
+        logger.warning("工具参数或接口兼容性异常: %s", e)
+        return _error_result(str(e))
     except Exception as e:
         logger.error(f"工具调用失败: {e}", exc_info=True)
-        return [TextContent(type="text", text=f"执行失败：{str(e)}")]
+        return _error_result(f"执行失败：{str(e)}")
 
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    finally:
+        await close_context()
 
 
 if __name__ == "__main__":
